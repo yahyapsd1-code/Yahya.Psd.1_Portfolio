@@ -3,10 +3,13 @@ import { db } from "@/db";
 import { messages } from "@/db/schema";
 import { contactSchema } from "@/lib/validation";
 import { rateLimit, getClientIp } from "@/lib/rate-limit";
+import { ensureSchema } from "@/lib/db-init";
 
 export const dynamic = "force-dynamic";
 
 export async function POST(request: NextRequest) {
+  // Guarantee the messages table exists on a fresh database.
+  await ensureSchema();
   const ip = getClientIp(request);
   const limited = rateLimit(`contact:${ip}`, 5, 60_000);
   if (!limited.ok) {

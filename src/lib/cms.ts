@@ -1,37 +1,29 @@
 import "server-only";
 import { revalidatePath } from "next/cache";
 import { db } from "@/db";
-import { siteContent, auditLogs } from "@/db/schema";
+import { auditLogs } from "@/db/schema";
 
-/** The public pages render dynamically, so a layout revalidate guarantees
- *  every visitor sees the latest content immediately (no redeploy needed). */
+/**
+ * The public pages render dynamically, so a layout revalidate guarantees
+ * every visitor sees the latest content immediately (no redeploy needed).
+ */
 export function revalidateAll() {
   revalidatePath("/", "layout");
 }
 
-/** Upsert one or more content sections and propagate instantly. */
-export async function saveSections(sections: Record<string, unknown>) {
-  for (const [key, data] of Object.entries(sections)) {
-    await db
-      .insert(siteContent)
-      .values({ key, data: data as Record<string, unknown> })
-      .onConflictDoUpdate({
-        target: siteContent.key,
-        set: { data: data as Record<string, unknown>, updatedAt: new Date() },
-      });
-  }
-  revalidateAll();
-}
+/**
+ * saveSection / saveSections are defined in @/lib/content so they can route
+ * each section to its dedicated table (hero, theme, settings, social_links,
+ * backgrounds) or the generic site_content store. Re-exported here to keep the
+ * existing API routes' imports stable.
+ */
+export { saveSection, saveSections } from "@/lib/content";
 
-export async function saveSection(key: string, data: unknown) {
-  await saveSections({ [key]: data });
-}
-
-/** Security audit trail. */
+/** Security audit trail (never lets a logging failure break a request). */
 export async function logAudit(actor: string, action: string, detail = "") {
   try {
     await db.insert(auditLogs).values({ actor, action, detail });
   } catch {
-    /* never let audit logging break a request */
+    /* ignore */
   }
 }

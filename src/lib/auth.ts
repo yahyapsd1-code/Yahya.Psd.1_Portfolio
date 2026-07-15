@@ -3,8 +3,9 @@ import { SignJWT, jwtVerify } from "jose";
 import { cookies } from "next/headers";
 import bcrypt from "bcryptjs";
 import { db } from "@/db";
-import { admins } from "@/db/schema";
+import { admin } from "@/db/schema";
 import { eq } from "drizzle-orm";
+import { ensureSchema } from "@/lib/db-init";
 
 export const SESSION_COOKIE = "studio_session";
 
@@ -44,19 +45,21 @@ async function decode(token: string): Promise<SessionPayload | null> {
 }
 
 export async function verifyCredentials(email: string, password: string) {
+  // Guarantee the admin table exists on a fresh database before querying.
+  await ensureSchema();
   const normalized = email.trim().toLowerCase();
   const rows = await db
     .select()
-    .from(admins)
-    .where(eq(admins.email, normalized));
-  const admin = rows[0];
-  if (!admin) return null;
-  const ok = await bcrypt.compare(password, admin.passwordHash);
+    .from(admin)
+    .where(eq(admin.email, normalized));
+  const found = rows[0];
+  if (!found) return null;
+  const ok = await bcrypt.compare(password, found.passwordHash);
   if (!ok) return null;
   return {
-    email: admin.email,
-    name: admin.name,
-    tokenVersion: admin.tokenVersion,
+    email: found.email,
+    name: found.name,
+    tokenVersion: found.tokenVersion,
   };
 }
 
@@ -68,13 +71,15 @@ export async function getSession(): Promise<SessionPayload | null> {
   const payload = await decode(token);
   if (!payload) return null;
 
+  // Guarantee the admin table exists on a fresh database before querying.
+  await ensureSchema();
   const rows = await db
-    .select({ ver: admins.tokenVersion })
-    .from(admins)
-    .where(eq(admins.email, payload.email));
-  const admin = rows[0];
+    .select({ ver: admin.tokenVersion })
+    .from(admin)
+    .where(eq(admin.email, payload.email));
+  const found = rows[0];
   // Token version mismatch => session revoked (logout from all devices).
-  if (!admin || admin.ver !== payload.ver) return null;
+  if (!found || found.ver !== payload.ver) return null;
   return payload;
 }
 

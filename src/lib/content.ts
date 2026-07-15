@@ -1,14 +1,25 @@
 import "server-only";
+import { revalidatePath } from "next/cache";
 import { db } from "@/db";
 import {
+  admin,
+  hero,
+  theme,
+  settings,
+  socialLinks,
+  backgrounds,
   siteContent,
   portfolio,
   testimonials,
-  admins,
   messages,
 } from "@/db/schema";
 import { eq, asc } from "drizzle-orm";
+import type { PgTableWithColumns } from "drizzle-orm/pg-core";
 import bcrypt from "bcryptjs";
+import { ensureSchema } from "@/lib/db-init";
+
+/** Section keys whose data lives in a dedicated singleton table. */
+const SINGLETON_KEYS = ["hero", "theme", "settings", "social", "background"] as const;
 
 /* -------------------------------------------------------------------------- */
 /*  Types                                                                     */
@@ -330,82 +341,168 @@ export const DEFAULT_TESTIMONIALS = [
 
 /* -------------------------------------------------------------------------- */
 /*  Idempotent seeding                                                        */
+/*                                                                            */
+/*  ensureSeeded() always calls ensureSchema() first so the tables are        */
+/*  guaranteed to exist (works on a completely empty Neon database). It then  */
+/*  inserts default content into any empty table, and is safe to re-run.      */
 /* -------------------------------------------------------------------------- */
 
 let seedingPromise: Promise<void> | null = null;
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type SingletonTable = PgTableWithColumns<any>;
+
+async function upsertSingleton(
+  table: SingletonTable,
+  data: Record<string, unknown>,
+) {
+  await db
+    .insert(table)
+    .values({ data })
+    .onConflictDoUpdate({
+      target: table.id,
+      set: { data, updatedAt: new Date() },
+    });
+}
+
 export async function ensureSeeded(): Promise<void> {
   if (seedingPromise) return seedingPromise;
+
   seedingPromise = (async () => {
-    const existing = await db
-      .select({ key: siteContent.key })
-      .from(siteContent);
+    // 1. Create the schema if it doesn't exist yet (fresh database safe).
+    await ensureSchema();
 
-    if (existing.length === 0) {
-      await db.insert(siteContent).values(
-        Object.entries(DEFAULT_CONTENT).map(([key, data]) => ({
-          key,
-          data: data as Record<string, unknown>,
-        })),
-      );
-
-      await db
-        .insert(portfolio)
-        .values(DEFAULT_PORTFOLIO);
-
-      await db
-        .insert(testimonials)
-        .values(DEFAULT_TESTIMONIALS);
-
-      const adminEmail =
-        process.env.ADMIN_EMAIL?.trim() || "admin@alexrivera.studio";
-      const adminPassword =
-        process.env.ADMIN_PASSWORD?.trim() || "admin12345";
-      const existingAdmin = await db
-        .select({ id: admins.id })
-        .from(admins)
-        .where(eq(admins.email, adminEmail));
-      if (existingAdmin.length === 0) {
-        const passwordHash = await bcrypt.hash(adminPassword, 12);
-        await db.insert(admins).values({
-          email: adminEmail,
-          name: "Alex Rivera",
-          passwordHash,
-        });
-      }
+    // 2. Default admin (if the admin table is empty).
+    const adminRows = await db.select({ id: admin.id }).from(admin).limit(1);
+    if (adminRows.length === 0) {
+      const adminEmail = process.env.ADMIN_EMAIL?.trim() || "admin@alexrivera.studio";
+      const adminPassword = process.env.ADMIN_PASSWORD?.trim() || "admin12345";
+      const passwordHash = await bcrypt.hash(adminPassword, 12);
+      await db.insert(admin).values({
+        email: adminEmail,
+        name: "Alex Rivera",
+        passwordHash,
+      });
     }
-  })();
+
+    // 3. Singleton sections (each only ever holds a single row).
+    const singletonChecks = await Promise.all([
+      db.select({ id: hero.id }).from(hero).limit(1),
+      db.select({ id: theme.id }).from(theme).limit(1),
+      db.select({ id: settings.id }).from(settings).limit(1),
+      db.select({ id: socialLinks.id }).from(socialLinks).limit(1),
+      db.select({ id: backgrounds.id }).from(backgrounds).limit(1),
+    ]);
+    if (singletonChecks[0].length === 0)
+      await upsertSingleton(hero, DEFAULT_CONTENT.hero);
+    if (singletonChecks[1].length === 0)
+      await upsertSingleton(theme, DEFAULT_CONTENT.theme);
+    if (singletonChecks[2].length === 0)
+      await upsertSingleton(settings, DEFAULT_CONTENT.settings);
+    if (singletonChecks[3].length === 0)
+      await upsertSingleton(socialLinks, DEFAULT_CONTENT.social);
+    if (singletonChecks[4].length === 0)
+      await upsertSingleton(backgrounds, DEFAULT_CONTENT.background);
+
+    // 4. Flexible key/value sections (about, workflow, journey, services,
+    //    statistics, contact, footer, seo).
+    const kvRows = await db.select({ key: siteContent.key }).from(siteContent);
+    if (kvRows.length === 0) {
+      const kvEntries = Object.entries(DEFAULT_CONTENT)
+        .filter(([key]) => !SINGLETON_KEYS.includes(key as never))
+        .map(([key, data]) => ({ key, data: data as Record<string, unknown> }));
+      if (kvEntries.length > 0) await db.insert(siteContent).values(kvEntries);
+    }
+
+    // 5. Portfolio + testimonials.
+    const [portfolioRows, testimonialRows] = await Promise.all([
+      db.select({ id: portfolio.id }).from(portfolio).limit(1),
+      db.select({ id: testimonials.id }).from(testimonials).limit(1),
+    ]);
+    if (portfolioRows.length === 0) await db.insert(portfolio).values(DEFAULT_PORTFOLIO);
+    if (testimonialRows.length === 0)
+      await db.insert(testimonials).values(DEFAULT_TESTIMONIALS);
+  })().catch((err) => {
+    // Reset so the next request can retry; never leave a permanently-rejected promise.
+    seedingPromise = null;
+    throw err;
+  });
+
   return seedingPromise;
 }
 
 /* -------------------------------------------------------------------------- */
 /*  Read helpers                                                              */
+/*                                                                            */
+/*  Every read is wrapped defensively: if the database is unreachable or the  */
+/*  query fails for any reason, the site still renders using in-memory        */
+/*  defaults instead of crashing.                                             */
 /* -------------------------------------------------------------------------- */
 
-export async function getSiteContent(): Promise<SiteContent> {
-  await ensureSeeded();
-  const rows = await db.select().from(siteContent);
+function cloneDefaults(): SiteContent {
   const out: SiteContent = {};
-  for (const row of rows) out[row.key] = row.data as Record<string, unknown>;
+  for (const [k, v] of Object.entries(DEFAULT_CONTENT))
+    out[k] = structuredClone(v) as Record<string, unknown>;
   return out;
 }
 
+export async function getSiteContent(): Promise<SiteContent> {
+  try {
+    await ensureSeeded();
+    const [heroR, themeR, settingsR, socialR, bgR] = await Promise.all([
+      db.select().from(hero),
+      db.select().from(theme),
+      db.select().from(settings),
+      db.select().from(socialLinks),
+      db.select().from(backgrounds),
+    ]);
+    const kvRows = await db.select().from(siteContent);
+
+    const out: SiteContent = {};
+    if (heroR[0]?.data) out.hero = heroR[0].data as Record<string, unknown>;
+    if (themeR[0]?.data) out.theme = themeR[0].data as Record<string, unknown>;
+    if (settingsR[0]?.data) out.settings = settingsR[0].data as Record<string, unknown>;
+    if (socialR[0]?.data) out.social = socialR[0].data as Record<string, unknown>;
+    if (bgR[0]?.data) out.background = bgR[0].data as Record<string, unknown>;
+    for (const row of kvRows) out[row.key] = row.data as Record<string, unknown>;
+
+    // Fill any missing section with in-memory defaults (defensive).
+    for (const [k, v] of Object.entries(DEFAULT_CONTENT)) {
+      if (!out[k]) out[k] = structuredClone(v) as Record<string, unknown>;
+    }
+    return out;
+  } catch (err) {
+    console.error("[content] getSiteContent failed, using defaults:", err);
+    return cloneDefaults();
+  }
+}
+
 export async function getPublishedPortfolio() {
-  await ensureSeeded();
-  return db
-    .select()
-    .from(portfolio)
-    .where(eq(portfolio.published, true))
-    .orderBy(asc(portfolio.order), asc(portfolio.id));
+  try {
+    await ensureSeeded();
+    return await db
+      .select()
+      .from(portfolio)
+      .where(eq(portfolio.published, true))
+      .orderBy(asc(portfolio.order), asc(portfolio.id));
+  } catch (err) {
+    console.error("[content] getPublishedPortfolio failed:", err);
+    return [];
+  }
 }
 
 export async function getPublishedTestimonials() {
-  await ensureSeeded();
-  return db
-    .select()
-    .from(testimonials)
-    .where(eq(testimonials.published, true))
-    .orderBy(asc(testimonials.order), asc(testimonials.id));
+  try {
+    await ensureSeeded();
+    return await db
+      .select()
+      .from(testimonials)
+      .where(eq(testimonials.published, true))
+      .orderBy(asc(testimonials.order), asc(testimonials.id));
+  } catch (err) {
+    console.error("[content] getPublishedTestimonials failed:", err);
+    return [];
+  }
 }
 
 /** Raw (admin) reads — never cached. */
@@ -422,4 +519,52 @@ export async function getAdminTestimonials() {
 export async function getMessages() {
   await ensureSeeded();
   return db.select().from(messages);
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Write helpers (routed to the correct table, with instant revalidation)    */
+/* -------------------------------------------------------------------------- */
+
+function revalidateAll() {
+  revalidatePath("/", "layout");
+}
+
+/** Persist a single section, routing singletons to their dedicated table. */
+export async function saveSection(key: string, data: unknown) {
+  await ensureSeeded();
+  const value = data as Record<string, unknown>;
+
+  switch (key) {
+    case "hero":
+      await upsertSingleton(hero, value);
+      break;
+    case "theme":
+      await upsertSingleton(theme, value);
+      break;
+    case "settings":
+      await upsertSingleton(settings, value);
+      break;
+    case "social":
+      await upsertSingleton(socialLinks, value);
+      break;
+    case "background":
+      await upsertSingleton(backgrounds, value);
+      break;
+    default:
+      await db
+        .insert(siteContent)
+        .values({ key, data: value })
+        .onConflictDoUpdate({
+          target: siteContent.key,
+          set: { data: value, updatedAt: new Date() },
+        });
+  }
+  revalidateAll();
+}
+
+/** Persist multiple sections at once. */
+export async function saveSections(sections: Record<string, unknown>) {
+  for (const [key, data] of Object.entries(sections)) {
+    await saveSection(key, data);
+  }
 }
